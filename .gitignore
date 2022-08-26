@@ -1,3 +1,4 @@
 /.venv
 local.env
 **/__pycache__/
+*.pyc

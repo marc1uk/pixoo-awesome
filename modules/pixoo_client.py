@@ -3,6 +3,39 @@ from math import log10, ceil
 from time import sleep
 from PIL import Image
 
+#VIEWTYPES = {
+#    "clock": 0x00,
+#    "temp": 0x01,
+#    "off": 0x02,
+#    "anim": 0x03,
+#    "graph": 0x04,
+#    "image": 0x05,
+#    "stopwatch": 0x06,
+#    "scoreboard": 0x07
+#}
+
+#def view(ctx, type):
+#    if (type in VIEWTYPES):
+#        ctx.obj['dev'].send(switch_view(type))
+
+#def clock(ctx, color, ampm):
+#    if (color):
+#        c = color_convert(Color(color).get_rgb())
+#        ctx.obj['dev'].send(set_time_color(c[0], c[1], c[2], 0xff, not ampm))
+#    else:
+#        ctx.obj['dev'].send(switch_view("clock"))
+
+#def temp(ctx, color, f):
+#    if (color):
+#        c = color_convert(Color(color).get_rgb())
+#        ctx.obj['dev'].send(set_temp_color(c[0], c[1], c[2], 0xff, f))
+#    else:
+#        ctx.obj['dev'].send(switch_view("temp"))
+
+#def switch_view(type):
+#    h = [0x04, 0x00, 0x45, VIEWTYPES[type]]
+#    ck1, ck2 = checksum(sum(h))
+#    return [0x01] + mask(h) + mask([ck1, ck2]) + [0x02]
 
 class Pixoo:
     CMD_SET_SYSTEM_BRIGHTNESS = 0x74
@@ -34,11 +67,20 @@ class Pixoo:
         """
         Connect to SPP.
         """
-        print(f"Connecting to {self.mac_address}...")
+        print("Connecting to "+self.mac_address+"...")
         self.btsock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
         self.btsock.connect((self.mac_address, 1))
         sleep(1)  # mandatory to wait at least 1 second
         print("Connected.")
+
+    def disconnect(self, shutdown=0, close=1):
+        # note 'shutdown' sends the disconnect signal to the resource,
+        # whereas close deletes our handle to it. The latter *must* be called,
+        # but the former will be called automatically if and only if we're the only
+        # application with a handle to that resource open.
+        # in order to not kill music, maybe only call close.
+        if shutdown==1: self.btsock.shutdown(socket.SHUT_RDWR)   # force disconnection of the device
+        if close==1: self.btsock.close()                # close our handle to the device
 
     def __spp_frame_checksum(self, args):
         """
@@ -66,6 +108,24 @@ class Pixoo:
 
         # return output buffer
         return frame_buffer + frame_suffix
+        
+#        01/05/00/5f/07/04/6f/00/02
+#        --|len  |data    |chks |--
+#        so data[5] is 5f/07/04
+#        
+#        01/03/00/27/02/2d/00/02
+#        --|len  |data |chks |--
+#        data[2] is 27/02
+#        
+#        we know that set box mode is 45....
+#        
+#        
+#        01/03/00/42/45/00/02
+#        --|len  |da|chk  |--
+#        
+#        
+#        01/0d/00/45/00/01/00/01/00/00/00/ff/ff/ff/51/03/02
+#        --|len  |45|-------------                |chk  |--
 
     def send(self, cmd, args):
         """
@@ -85,7 +145,16 @@ class Pixoo:
         """
         Set box mode.
         """
-        self.send(0x45, [boxmode & 0xFF, visual & 0xFF, mode & 0xFF])
+        # original: works but also enables cycling of weather and temp too.
+        #self.send(0x45, [boxmode & 0xFF, visual & 0xFF, mode & 0xFF])
+        #self.send(0x45, [0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF])  # just white clock
+        self.send(0x45, [boxmode & 0xFF, 0x01, visual & 0xFF, mode & 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF])
+        #               [ boxmode | ? | clockstyle | vis |  ? | ? | ? | R | G | B ]
+        # vis: 0= clock, 1=clock, 2=weather only, 3 = weather/clock alternating
+        # 4= temp, 5= temp/clock alt., 6=weather/temp alt., 7=clock/weather/temp alternating,
+        # 8= planner, 9=planner/clock, 10=HOT, 11=clock/HOT, 12=HOT/weather/temp
+        # 13=weather/HOT/clock, ..... 
+        # seems like the above commands enable, but do not disable, the respective parts.
 
     def set_color(self, r, g, b):
         """
@@ -108,15 +177,35 @@ class Pixoo:
             if w > 16:
                 img = img.resize((16, 16))
 
+            # so here it doesnt transmit an [rgba] value for every pixel,
+            # but rather scans all pixels for an array of all unique [rgba]
+            # combinations, defines that as the 'palette', and then sends pixels
+            # as an array of palette indexes.
+            # except it's not rgba, it's just rgb.
+            # the "transparency" just comes from the fact that all completely transparent
+            # pixels tend to be encoded with the same value, and for pomu pngs,
+            # that value is (0,0,0,0) i.e. transparent *black* -> i.e. becomes black.
+            # for calli (gimp) pngs, the transparent pixel was (255,255,255,0) -> i.e. white.
+            # 
+            # we can work around this by fixing any pixels with alpha = 0 (fully transparent)
+            # to have rgb=0.
+            
+
             # create palette and pixel array
             pixels = []
             palette = []
+            first = True
             for y in range(16):
                 for x in range(16):
                     pix = img.getpixel((x, y))
 
                     if len(pix) == 4:
                         r, g, b, a = pix
+                        #if first == True:
+                        #    print("first pixel: ",r,g,b,a)
+                        #    first = False
+                        if a == 0:
+                            r, g, b, a = [0,0,0,0]
                     elif len(pix) == 3:
                         r, g, b = pix
                     if (r, g, b) not in palette:
@@ -139,9 +228,16 @@ class Pixoo:
                     encoded_pixels.append(encoded_byte[-8:])
                     encoded_byte = encoded_byte[:-8]
             encoded_data = [int(c, 2) for c in encoded_pixels]
+            #print("pixel one is ",pixels[0])
+            #print("encoded is ",encoded_pixels[0])
             encoded_palette = []
+            first = False
             for r, g, b in palette:
-                encoded_palette += [r, g, b]
+                if first == False: encoded_palette += [r, g, b]
+                else:
+                    encoded_palette += [0, 0, 0]
+                    first = False
+            #print("encoded palette is ",encoded_palette)
             return (len(palette), encoded_palette, encoded_data)
         else:
             print("[!] Image must be square.")
@@ -156,7 +252,7 @@ class Pixoo:
         anim_gif = Image.open(filepath)
         for n in range(anim_gif.n_frames):
             anim_gif.seek(n)
-            nb_colors, palette, pixel_data = self.encode_raw_image(anim_gif.convert(mode="RGB"))
+            nb_colors, palette, pixel_data = self.encode_raw_image(anim_gif.convert(mode="RGBA"))
             frame_size = 7 + len(pixel_data) + len(palette)
             frame_header = [
                 0xAA,
@@ -256,7 +352,7 @@ class PixooMax(Pixoo):
 
     def encode_image(self, filepath):
         img = Image.open(filepath)
-        img = img.convert(mode="P", palette=Image.ADAPTIVE, colors=256).convert(mode="RGB")
+        img = img.convert(mode="P", palette=Image.ADAPTIVE, colors=256).convert(mode="RGBA")
         return self.encode_raw_image(img)
 
     def encode_raw_image(self, img):
@@ -279,6 +375,8 @@ class PixooMax(Pixoo):
 
                     if len(pix) == 4:
                         r, g, b, a = pix
+                        if a == 0:
+                            r, g, b = (0, 0, 0)
                     elif len(pix) == 3:
                         r, g, b = pix
                     if (r, g, b) not in palette:
